@@ -1,0 +1,123 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux
+          - os: windows-latest
+            label: windows
+          - os: macos-latest
+            label: macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Prepare dist (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/release/tcp-transfer-ice dist/
+          cp tcp_server_ice_NEW.py dist/
+          cp README.md dist/
+
+      - name: Prepare dist (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\tcp-transfer-ice.exe dist\
+          Copy-Item tcp_server_ice_NEW.py dist\
+          Copy-Item README.md dist\
+
+      - name: Create archive (unix)
+        if: runner.os != 'Windows'
+        run: |
+          python - <<'PY'
+          import os
+          import zipfile
+
+          label = "${{ matrix.label }}"
+          archive = f"tcp-transfer-ice-{label}.zip"
+          base_dir = "dist"
+
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+              for root, _dirs, files in os.walk(base_dir):
+                  for name in files:
+                      path = os.path.join(root, name)
+                      rel = os.path.relpath(path, base_dir)
+                      zf.write(path, rel)
+          PY
+
+      - name: Create archive (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          @'
+          import os
+          import zipfile
+
+          label = "${{ matrix.label }}"
+          archive = f"tcp-transfer-ice-{label}.zip"
+          base_dir = "dist"
+
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+              for root, _dirs, files in os.walk(base_dir):
+                  for name in files:
+                      path = os.path.join(root, name)
+                      rel = os.path.relpath(path, base_dir)
+                      zf.write(path, rel)
+          '@ | python -
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcp-transfer-ice-${{ matrix.label }}
+          path: tcp-transfer-ice-${{ matrix.label }}.zip
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/tcp-transfer-ice-*.zip
+          generate_release_notes: true
