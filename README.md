@@ -22,14 +22,22 @@ High-performance TCP file transfer with NAT traversal (hole punching).
 
 The relay server runs a short NAT probing phase when a peer does not preserve ports:
 
-- The client opens several quick probe connections to `--probe-port`.
-- The server records the observed public ports and computes a prediction model:
-  - If ports are preserved, no scan is needed.
-  - Otherwise, it estimates a delta-based predicted port and an error range.
-  - For progressing symmetric NATs, it also estimates a port allocation rate and shifts the prediction forward.
-  - For random-like NATs, it uses the observed min/max range and builds a sparse candidate list.
-- The server sends `peer_info` with a prioritized candidate list of ports (capped by `MAX_SCAN_PORTS`).
-- The client tries only those candidates; this is a bounded scan, not a full port sweep.
+- The client opens several quick probe connections to `--probe-port` (server waits for at least 5).
+- The server records `(local_port, observed_public_port, timestamp)` and computes a prediction model:
+  - delta = public_port - local_port
+  - predicted_port = local_port + median(delta)
+  - error_range = max deviation + jitter (2 * stdev, min 2)
+  - For progressing symmetric NATs, estimate a port allocation rate and shift the prediction forward
+    (`port_rate * prediction_delay * RATE_DAMPING`, capped by `MAX_RATE_SHIFT`).
+- The server classifies the pattern (`port_preserved`, `constant_delta`, `small/medium/large_delta_range`,
+  `random_like`) and builds a bounded candidate list:
+  - For non-random patterns, use a contiguous window around `predicted_port` and cap to `MAX_SCAN_PORTS`.
+  - For `random_like`, use the observed min/max range and build a sparse list:
+    `predicted_port`, `min_port+1..+5`, plus evenly spaced samples, capped to `MAX_SCAN_PORTS`.
+- The server sends `peer_info` with the prioritized candidate list; the client tries only those candidates.
+
+These additions (rate-based forward shift and sparse random-like sampling) extend the standard delta-only
+prediction and reduce the number of attempts without a full port sweep.
 
 ## Usage
 
