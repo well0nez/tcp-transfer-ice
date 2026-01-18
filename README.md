@@ -102,7 +102,9 @@ The binary will be at `target/release/tcp-transfer`.
 5. **DONE**: Sender signals completion `[type=5]`
 6. **ACK**: Receiver confirms SHA256 verified `[type=6]`
 
-## Comparison with UDP Version
+## Comparison with UDP Hole Punching (general)
+
+Note: This repo does not include a UDP implementation; the comparison is conceptual.
 
 | Feature | UDP Transfer | TCP Transfer |
 |---------|-------------|--------------|
