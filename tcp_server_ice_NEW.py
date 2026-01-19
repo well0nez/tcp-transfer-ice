@@ -109,6 +109,8 @@ class Peer:
     needs_probing: bool = False  # True if NAT port changed (not preserved)
     prediction_mode: str = "delta"  # delta or external
     prediction_range_extra_pct: float = 0.0  # percent to expand scan range
+    local_ports: List[int] = field(default_factory=list)
+    port_analyses: List[dict] = field(default_factory=list)
 
 
 class TCPRelayServerICE:
@@ -208,6 +210,83 @@ class TCPRelayServerICE:
             self.session_locks[session_id] = asyncio.Lock()
         return self.session_locks[session_id]
     
+    def parse_local_ports(self, local_ports_raw, fallback_port: int) -> List[int]:
+        ports: List[int] = []
+        if isinstance(local_ports_raw, list):
+            for port in local_ports_raw:
+                try:
+                    port_int = int(port)
+                except (TypeError, ValueError):
+                    continue
+                if MIN_PORT <= port_int <= MAX_PORT:
+                    ports.append(port_int)
+
+        seen = set()
+        ordered: List[int] = []
+        for port in ports:
+            if port in seen:
+                continue
+            seen.add(port)
+            ordered.append(port)
+
+        if fallback_port and fallback_port not in ordered:
+            ordered.insert(0, fallback_port)
+        if not ordered and fallback_port:
+            ordered = [fallback_port]
+
+        return ordered
+
+    def build_port_analyses(
+        self,
+        probes: List[Tuple[str, int, int, float]],
+        local_ports: List[int],
+        prediction_mode: str,
+        prediction_range_extra_pct: float,
+    ) -> List[dict]:
+        analyses = []
+        seen = set()
+        for port in local_ports:
+            if port <= 0 or port in seen:
+                continue
+            seen.add(port)
+            analysis = self.analyze_nat(
+                probes,
+                port,
+                prediction_mode,
+                prediction_range_extra_pct,
+            )
+            analyses.append({
+                'local_port': port,
+                'nat_analysis': analysis.to_dict(),
+            })
+        return analyses
+
+    def build_port_analyses_preserved(self, local_ports: List[int]) -> List[dict]:
+        analyses = []
+        seen = set()
+        for port in local_ports:
+            if port <= 0 or port in seen:
+                continue
+            seen.add(port)
+            analysis = NATAnalysis(
+                probed_ports=[port],
+                local_ports=[port],
+                min_port=port,
+                max_port=port,
+                port_range=0,
+                predicted_port=port,
+                error_range=0,
+                pattern_type="port_preserved",
+                needs_scan=False,
+                scan_start=port,
+                scan_end=port,
+            )
+            analyses.append({
+                'local_port': port,
+                'nat_analysis': analysis.to_dict(),
+            })
+        return analyses
+
     def analyze_nat(
         self,
         probes: List[Tuple[str, int, int, float]],
@@ -419,6 +498,7 @@ class TCPRelayServerICE:
             session_id = msg['session_id']
             role = msg['role']
             local_port = msg.get('local_port', 0)
+            local_ports = self.parse_local_ports(msg.get('local_ports'), local_port)
             private_ip = msg.get('private_ip')
             skip_probing = msg.get('skip_probing', False)  # For clients that don't support probing
             prediction_mode = (msg.get('prediction_mode') or 'delta').lower()
@@ -449,6 +529,7 @@ class TCPRelayServerICE:
                 private_ip=private_ip,
                 prediction_mode=prediction_mode,
                 prediction_range_extra_pct=prediction_range_extra_pct,
+                local_ports=local_ports,
             )
             
             lock = self.get_session_lock(session_id)
@@ -490,6 +571,8 @@ class TCPRelayServerICE:
                     scan_start=predicted_port,
                     scan_end=predicted_port,
                 )
+                if peer.local_ports:
+                    peer.port_analyses = self.build_port_analyses_preserved(peer.local_ports)
             
             # Send registration ACK with needs_probing flag
             await self.send_message(writer, {
@@ -629,6 +712,13 @@ class TCPRelayServerICE:
                     peer.prediction_mode,
                     peer.prediction_range_extra_pct,
                 )
+                if peer.local_ports:
+                    peer.port_analyses = self.build_port_analyses(
+                        peer_probes,
+                        peer.local_ports,
+                        peer.prediction_mode,
+                        peer.prediction_range_extra_pct,
+                    )
                 # Clear used probes
                 self.pending_probes[session_id] = [
                     (ip, nat, local, ts) for ip, nat, local, ts in probes
@@ -727,6 +817,8 @@ class TCPRelayServerICE:
                 'same_network': False,
                 'peer_nat_analysis': receiver.nat_analysis.to_dict() if receiver.nat_analysis else None
             }
+            if receiver.port_analyses:
+                msg_to_sender['peer_port_analyses'] = receiver.port_analyses
             await self.send_message(sender.writer, msg_to_sender)
             
             # Send to receiver
@@ -739,6 +831,8 @@ class TCPRelayServerICE:
                 'same_network': False,
                 'peer_nat_analysis': sender.nat_analysis.to_dict() if sender.nat_analysis else None
             }
+            if sender.port_analyses:
+                msg_to_receiver['peer_port_analyses'] = sender.port_analyses
             await self.send_message(receiver.writer, msg_to_receiver)
             
             logger.info(f"Session {session_id}: peer_info with NAT analysis sent!")

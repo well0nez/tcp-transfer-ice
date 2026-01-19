@@ -10,6 +10,7 @@ A TCP file-transfer tool with NAT traversal (TCP hole punching) coordinated by a
 - **NAT Probing + Prediction**: Uses a probe port to predict a NAT port range and build a capped scan list
 - **SHA256 Verification**: Ensures file integrity after transfer
 - **Progress Bar**: Real-time transfer progress with speed display
+- **Multi-TCP (optional)**: Use multiple parallel TCP connections for transfer
 - **Session-Based**: Both peers connect using a shared session ID
 
 ## How It Works
@@ -49,9 +50,9 @@ NAT because the peer-specific NAT port may lie outside the small probe-derived r
 - Pros: Higher success probability when NAT port allocation is wide or target-dependent.
 - Cons: More outbound connection attempts, higher CPU/network load, and potential throttling by NATs/ISPs.
 
-In our tests, success on difficult NAT pairs improved most when widening the scan window with
-`--prediction-range-extra-pct` (often 20-50), and a higher `--max-scan-ports` helped ensure the wider
-window could actually be attempted. Results still depend on the networks and devices involved.
+In our tests, the biggest gains came from widening the scan window with
+`--prediction-range-extra-pct` (often 20-50). Combined with `--max-scan-ports 512`, this reached
+roughly 99% success on difficult NAT pairs, but results still depend on the networks and devices involved.
 
 ### Client Prediction Mode
 
@@ -71,8 +72,8 @@ raising this to around 20-50 can materially improve success rates.
 
 ### Probe Debug Mode
 
-Use `--probe-debug` to run only the probe phase and print the observed local/NAT port pairs
-with summary stats (min/max/range/median/stdev). The probe port is derived as `server_port - 1`
+Use `--probe-debug` to run only the probe phase and print summary stats
+(min/max/range/median/stdev) plus an estimated NAT type. The probe port is derived as `server_port - 1`
 (for example, `--server 1.2.3.4:9999` probes `1.2.3.4:9998`).
 
 Example:
@@ -120,13 +121,19 @@ Options:
   -f, --file <FILE>          File to send (sender mode only)
       --timeout <SECONDS>    Hole punch timeout [default: 30]
       --probe-count <N>      NAT probe connection count [default: 10]
-      --probe-debug          Run probe-only debug mode and print observed ports
+      --probe-debug          Run probe-only debug mode and print summary stats
       --prediction-mode <MODE>  NAT prediction mode: delta or external [default: delta]
       --prediction-range-extra-pct <PCT>  Expand scan range by percentage [default: 0]
+      --chunk <SIZE>         Chunk size for transfer (e.g., 512KB, 1MB) [default: 8MB]
       --debug                Enable debug logging
   -h, --help                 Print help
   -V, --version              Print version
+
+Multi-TCP options:
+      --tcp-connections <N>  Number of parallel TCP connections [default: 1, allowed: 1,2,4,8]
+      --scan-budget <N>      Global scan budget across all connections (0 = unlimited) [default: 1024]
 ```
+
 
 ## Building
 
@@ -141,8 +148,10 @@ The binary will be at `target/release/tcp-transfer`.
 ### Relay Server Protocol (JSON over TCP)
 
 1. **Registration**: Client sends `{"type": "register", "session_id": "...", "role": "sender|receiver", "local_port": 12345}`
+   - Optional for Multi-TCP: `"tcp_connections": N` and `"local_ports": [..]`
 2. **Registered**: Server responds `{"type": "registered", "your_public_addr": ["ip", port], "needs_probing": true|false, "probe_port": 9998}`
 3. **Peer Info**: When both peers are connected, server sends `{"type": "peer_info", "peer_public_addr": ["ip", port], "peer_addresses": [...], "peer_nat_analysis": {...}}`
+   - Optional: `peer_port_analyses` list with per-local-port NAT analysis
 
 ### File Transfer Protocol (Binary over direct TCP)
 

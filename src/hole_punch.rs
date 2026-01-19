@@ -58,6 +58,7 @@ impl PeerAddress {
 }
 
 /// Configuration for hole punching
+#[derive(Clone)]
 pub struct HolePunchConfig {
     /// Local port to bind to (MUST match what we told the relay!)
     pub local_port: u16,
@@ -499,6 +500,77 @@ pub async fn direct_connect(addr: SocketAddr, timeout: Duration) -> Result<TcpSt
         Ok(Err(e)) => Err(anyhow!("Connection failed: {}", e)),
         Err(_) => Err(anyhow!("Connection timeout")),
     }
+}
+
+
+/// Perform multiple hole punches in parallel (one per conn_id)
+pub async fn do_hole_punch_multi(
+    configs: Vec<(u8, HolePunchConfig)>,
+    retry_limit: u8,
+) -> Result<Vec<(u8, TcpStream)>> {
+    if configs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut handles = Vec::with_capacity(configs.len());
+    for (conn_id, config) in configs {
+        let handle = tokio::spawn(async move {
+            let result = do_hole_punch_with_retries(config, retry_limit).await;
+            (conn_id, result)
+        });
+        handles.push(handle);
+    }
+
+    let mut streams = Vec::new();
+    let mut failures = Vec::new();
+
+    for handle in handles {
+        let (conn_id, result) = handle.await
+            .map_err(|e| anyhow!("Hole punch task panicked: {}", e))?;
+        match result {
+            Ok(stream) => streams.push((conn_id, stream)),
+            Err(e) => failures.push((conn_id, e)),
+        }
+    }
+
+    if !failures.is_empty() {
+        for (_id, stream) in streams {
+            drop(stream);
+        }
+        let ids: Vec<String> = failures.iter().map(|(id, _)| id.to_string()).collect();
+        return Err(anyhow!("Multi hole punch failed for conn_id(s): {}", ids.join(", ")));
+    }
+
+    streams.sort_by_key(|(id, _)| *id);
+    Ok(streams)
+}
+
+async fn do_hole_punch_with_retries(
+    mut config: HolePunchConfig,
+    retry_limit: u8,
+) -> Result<TcpStream> {
+    let attempts = std::cmp::max(1, retry_limit);
+    let per_attempt_ms = std::cmp::max(1000, (config.timeout.as_millis() / attempts as u128) as u64);
+    let per_attempt_timeout = Duration::from_millis(per_attempt_ms);
+
+    for attempt in 1..=attempts {
+        let mut attempt_config = config.clone();
+        attempt_config.timeout = per_attempt_timeout;
+        match do_hole_punch(attempt_config).await? {
+            HolePunchResult::Success(stream) => return Ok(stream),
+            HolePunchResult::Timeout => {
+                if attempt >= attempts {
+                    break;
+                }
+                let delay = Duration::from_millis(300);
+                tokio::time::sleep(delay).await;
+                config.start_at = current_timestamp() + 0.5;
+                config.time_offset = 0.0;
+            }
+        }
+    }
+
+    Err(anyhow!("Hole punch failed after {} attempts", attempts))
 }
 
 #[cfg(test)]

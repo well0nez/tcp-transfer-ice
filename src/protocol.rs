@@ -26,6 +26,10 @@ pub struct RegisterMessage {
     pub prediction_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prediction_range_extra_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_connections: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_ports: Option<Vec<u16>>,
 }
 
 impl RegisterMessage {
@@ -35,6 +39,8 @@ impl RegisterMessage {
         local_port: u16,
         prediction_mode: Option<String>,
         prediction_range_extra_pct: Option<f64>,
+        tcp_connections: Option<u8>,
+        local_ports: Option<Vec<u16>>,
     ) -> Self {
         Self {
             msg_type: "register".to_string(),
@@ -44,6 +50,8 @@ impl RegisterMessage {
             private_ip: get_private_ip(),
             prediction_mode,
             prediction_range_extra_pct,
+            tcp_connections,
+            local_ports,
         }
     }
 }
@@ -129,6 +137,13 @@ pub struct PeerAddressInfo {
     pub confidence: Option<f64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct PeerPortAnalysis {
+    pub local_port: u16,
+    #[serde(default)]
+    pub nat_analysis: NATAnalysis,
+}
+
 /// NAT Analysis from server - Focus on PORT RANGE!
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct NATAnalysis {
@@ -148,6 +163,19 @@ pub struct NATAnalysis {
     pub max_port: u16,
     #[serde(default)]
     pub port_range: u16,
+
+    #[serde(default)]
+    pub predicted_port: u16,
+    #[serde(default)]
+    pub error_range: u16,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub delta_min: i32,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub delta_max: i32,
+    #[serde(default)]
+    pub delta_median: f64,
     
     // Classification
     #[serde(default)]
@@ -270,6 +298,8 @@ pub enum RelayMessage {
         same_network: bool,
         #[serde(default)]
         peer_nat_analysis: Option<NATAnalysis>,
+        #[serde(default)]
+        peer_port_analyses: Option<Vec<PeerPortAnalysis>>,
     },
     
     #[serde(rename = "go")]
@@ -319,6 +349,16 @@ pub mod transfer {
         Done = 5,        // Transfer complete
         Ack = 6,         // Final acknowledgment
         Error = 7,       // Error message (reserved for future use)
+        MultiHello = 8,      // Multi-conn handshake
+        MultiPlan = 9,       // Multi-conn plan
+        MultiPlanAck = 10,   // Multi-conn plan ack
+        MultiReady = 11,     // Connection ready
+        MultiStart = 12,     // Start transfer
+        ChunkHeader = 13,    // Chunk header (offset-based)
+        ChunkAck = 14,       // Chunk ack
+        ChunkNack = 15,      // Chunk nack
+        TransferDone = 16,   // Transfer done (multi)
+        TransferDoneAck = 17,// Transfer done ack (multi)
     }
 
     impl MessageType {
@@ -331,6 +371,16 @@ pub mod transfer {
                 5 => Some(Self::Done),
                 6 => Some(Self::Ack),
                 7 => Some(Self::Error),
+                8 => Some(Self::MultiHello),
+                9 => Some(Self::MultiPlan),
+                10 => Some(Self::MultiPlanAck),
+                11 => Some(Self::MultiReady),
+                12 => Some(Self::MultiStart),
+                13 => Some(Self::ChunkHeader),
+                14 => Some(Self::ChunkAck),
+                15 => Some(Self::ChunkNack),
+                16 => Some(Self::TransferDone),
+                17 => Some(Self::TransferDoneAck),
                 _ => None,
             }
         }
@@ -363,6 +413,233 @@ pub mod transfer {
             }
             let role = String::from_utf8(data[5..5 + len].to_vec()).ok()?;
             Some(Self { role })
+        }
+    }
+
+
+    /// Multi-connection hello message
+    #[derive(Debug, Clone)]
+    pub struct MultiHelloMessage {
+        pub role: String,
+        pub total_conns: u8,
+        pub conn_id: u8,
+    }
+
+    impl MultiHelloMessage {
+        pub fn encode(&self) -> BytesMut {
+            let role_bytes = self.role.as_bytes();
+            let mut buf = BytesMut::with_capacity(7 + role_bytes.len());
+            buf.put_u8(MessageType::MultiHello as u8);
+            buf.put_u8(self.total_conns);
+            buf.put_u8(self.conn_id);
+            buf.put_u32(role_bytes.len() as u32);
+            buf.put_slice(role_bytes);
+            buf
+        }
+
+        pub fn decode(data: &[u8]) -> Option<Self> {
+            if data.len() < 7 {
+                return None;
+            }
+            let total_conns = data[1];
+            let conn_id = data[2];
+            let mut cursor = &data[3..];
+            let len = cursor.get_u32() as usize;
+            if data.len() < 7 + len {
+                return None;
+            }
+            let role = String::from_utf8(data[7..7 + len].to_vec()).ok()?;
+            Some(Self {
+                role,
+                total_conns,
+                conn_id,
+            })
+        }
+    }
+
+    /// Multi-connection plan message
+    #[derive(Debug, Clone)]
+    pub struct MultiPlanMessage {
+        pub total_conns: u8,
+        pub retry_limit: u8,
+        pub start_at: f64,
+        pub local_ports: Vec<u16>,
+    }
+
+    impl MultiPlanMessage {
+        pub fn encode(&self) -> BytesMut {
+            let mut buf = BytesMut::with_capacity(12 + (self.local_ports.len() * 2));
+            buf.put_u8(MessageType::MultiPlan as u8);
+            buf.put_u8(self.total_conns);
+            buf.put_u8(self.retry_limit);
+            buf.put_u64(self.start_at.to_bits());
+            buf.put_u8(self.local_ports.len() as u8);
+            for port in &self.local_ports {
+                buf.put_u16(*port);
+            }
+            buf
+        }
+
+        pub fn decode(data: &[u8]) -> Option<Self> {
+            if data.len() < 12 {
+                return None;
+            }
+            let total_conns = data[1];
+            let retry_limit = data[2];
+            let mut cursor = &data[3..];
+            let start_at = f64::from_bits(cursor.get_u64());
+            let port_count = cursor.get_u8() as usize;
+            if cursor.remaining() < port_count * 2 {
+                return None;
+            }
+            let mut local_ports = Vec::with_capacity(port_count);
+            for _ in 0..port_count {
+                local_ports.push(cursor.get_u16());
+            }
+            Some(Self {
+                total_conns,
+                retry_limit,
+                start_at,
+                local_ports,
+            })
+        }
+    }
+
+
+    /// Multi-connection plan ack message
+    #[derive(Debug, Clone)]
+    pub struct MultiPlanAckMessage {
+        pub total_conns: u8,
+        pub local_ports: Vec<u16>,
+    }
+
+    impl MultiPlanAckMessage {
+        pub fn encode(&self) -> BytesMut {
+            let mut buf = BytesMut::with_capacity(3 + (self.local_ports.len() * 2));
+            buf.put_u8(MessageType::MultiPlanAck as u8);
+            buf.put_u8(self.total_conns);
+            buf.put_u8(self.local_ports.len() as u8);
+            for port in &self.local_ports {
+                buf.put_u16(*port);
+            }
+            buf
+        }
+
+        pub fn decode(data: &[u8]) -> Option<Self> {
+            if data.len() < 3 {
+                return None;
+            }
+            let total_conns = data[1];
+            let port_count = data[2] as usize;
+            if data.len() < 3 + (port_count * 2) {
+                return None;
+            }
+            let mut cursor = &data[3..];
+            let mut local_ports = Vec::with_capacity(port_count);
+            for _ in 0..port_count {
+                local_ports.push(cursor.get_u16());
+            }
+            Some(Self {
+                total_conns,
+                local_ports,
+            })
+        }
+    }
+
+    /// Multi-connection ready message
+    #[derive(Debug, Clone)]
+    pub struct MultiReadyMessage {
+        pub conn_id: u8,
+    }
+
+    impl MultiReadyMessage {
+        pub fn encode(&self) -> BytesMut {
+            let mut buf = BytesMut::with_capacity(2);
+            buf.put_u8(MessageType::MultiReady as u8);
+            buf.put_u8(self.conn_id);
+            buf
+        }
+
+        pub fn decode(data: &[u8]) -> Option<Self> {
+            if data.len() < 2 {
+                return None;
+            }
+            Some(Self { conn_id: data[1] })
+        }
+    }
+
+    /// Chunk header message
+    #[derive(Debug, Clone)]
+    pub struct ChunkHeaderMessage {
+        pub chunk_id: u32,
+        pub offset: u64,
+        pub len: u32,
+        pub hash32: u32,
+    }
+
+    impl ChunkHeaderMessage {
+        pub fn encode(&self) -> BytesMut {
+            let mut buf = BytesMut::with_capacity(21);
+            buf.put_u8(MessageType::ChunkHeader as u8);
+            buf.put_u32(self.chunk_id);
+            buf.put_u64(self.offset);
+            buf.put_u32(self.len);
+            buf.put_u32(self.hash32);
+            buf
+        }
+
+        pub fn decode(data: &[u8]) -> Option<Self> {
+            if data.len() < 21 {
+                return None;
+            }
+            let mut cursor = &data[1..];
+            let chunk_id = cursor.get_u32();
+            let offset = cursor.get_u64();
+            let len = cursor.get_u32();
+            let hash32 = cursor.get_u32();
+            Some(Self {
+                chunk_id,
+                offset,
+                len,
+                hash32,
+            })
+        }
+    }
+
+    /// Chunk ack/nack message
+    #[derive(Debug, Clone)]
+    pub struct ChunkAckMessage {
+        pub chunk_id: u32,
+        pub is_nack: bool,
+    }
+
+    impl ChunkAckMessage {
+        pub fn encode(&self) -> BytesMut {
+            let mut buf = BytesMut::with_capacity(5);
+            let msg_type = if self.is_nack {
+                MessageType::ChunkNack
+            } else {
+                MessageType::ChunkAck
+            };
+            buf.put_u8(msg_type as u8);
+            buf.put_u32(self.chunk_id);
+            buf
+        }
+
+        pub fn decode(data: &[u8]) -> Option<Self> {
+            if data.len() < 5 {
+                return None;
+            }
+            let msg_type = MessageType::from_u8(data[0])?;
+            if msg_type != MessageType::ChunkAck && msg_type != MessageType::ChunkNack {
+                return None;
+            }
+            let mut cursor = &data[1..];
+            let chunk_id = cursor.get_u32();
+            Some(Self {
+                chunk_id,
+                is_nack: msg_type == MessageType::ChunkNack,
+            })
         }
     }
 

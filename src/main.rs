@@ -30,12 +30,31 @@ mod protocol;
 mod hole_punch;
 mod transfer;
 
-use protocol::{RegisterMessage, ReadyMessage, RelayMessage, ProbeMessage};
+use protocol::{RegisterMessage, ReadyMessage, RelayMessage, ProbeMessage, NATAnalysis};
 use hole_punch::{HolePunchConfig, HolePunchResult, PeerAddress, do_hole_punch};
-use transfer::{TcpSender, TcpReceiver, calculate_sha256, set_chunk_size};
+use transfer::{
+    TcpSender,
+    TcpReceiver,
+    MultiSender,
+    MultiReceiver,
+    calculate_sha256,
+    set_chunk_size,
+    multi_handshake_sender,
+    multi_handshake_receiver,
+    multi_hello_sender,
+    multi_hello_receiver,
+    send_multi_ready,
+    read_multi_ready,
+    send_multi_start,
+    read_multi_start,
+};
 
 /// Number of NAT probes to send
 const DEFAULT_NAT_PROBE_COUNT: u32 = 10;
+const MIN_PORT: u16 = 1024;
+const MAX_PORT: u16 = 65535;
+const MAX_SCAN_PORTS: usize = 512;
+const MULTI_START_DELAY_SEC: f64 = 2.0;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -101,12 +120,20 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     prediction_range_extra_pct: f64,
     
+    /// Number of parallel TCP connections (multi TCP)
+    #[arg(long, default_value_t = 1, help_heading = "Multi-TCP")]
+    tcp_connections: u8,
+    
+    /// Global scan budget across all connections (0 = unlimited)
+    #[arg(long, default_value_t = 1024, help_heading = "Multi-TCP")]
+    scan_budget: u32,
+    
     /// Enable debug logging
     #[arg(long)]
     debug: bool,
     
     /// Chunk size for transfer (e.g., 512KB, 1MB, 2MB)
-    #[arg(long, default_value = "1MB")]
+    #[arg(long, default_value = "8MB")]
     chunk: String,
 }
 
@@ -137,6 +164,8 @@ fn parse_chunk_size(s: &str) -> Result<usize> {
 struct Session {
     peer_public_addr: Option<SocketAddr>,
     peer_addresses: Vec<PeerAddress>,
+    peer_nat_analysis: Option<protocol::NATAnalysis>,
+    peer_port_analyses: Option<Vec<protocol::PeerPortAnalysis>>,
     same_network: bool,
     start_at: Option<f64>,
     /// Time offset for clock sync: local_time + offset = server_time
@@ -271,12 +300,323 @@ fn create_bound_socket(local_port: u16) -> Result<Socket> {
     Ok(socket)
 }
 
+
+struct PredictionRange {
+    predicted_port: u16,
+    scan_start: u16,
+    scan_end: u16,
+    needs_scan: bool,
+    pattern_type: String,
+    min_port: u16,
+}
+
+fn current_timestamp() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
+fn clamp_port(port: i32) -> u16 {
+    port.clamp(MIN_PORT as i32, MAX_PORT as i32) as u16
+}
+
+fn apply_range_extra(scan_start: i32, scan_end: i32, pct: f64) -> (i32, i32) {
+    if pct <= 0.0 {
+        return (scan_start, scan_end);
+    }
+    if scan_end <= scan_start {
+        return (scan_start, scan_end);
+    }
+    let span = (scan_end - scan_start) as f64;
+    let extra_total = (span * (pct / 100.0)).round() as i32;
+    if extra_total <= 0 {
+        return (scan_start, scan_end);
+    }
+    let pad_low = extra_total / 2;
+    let pad_high = extra_total - pad_low;
+    let new_start = (scan_start - pad_low).max(MIN_PORT as i32);
+    let new_end = (scan_end + pad_high).min(MAX_PORT as i32);
+    (new_start, new_end)
+}
+
+fn compute_prediction_range(
+    peer_local_port: u16,
+    nat: &NATAnalysis,
+    prediction_mode: PredictionMode,
+    prediction_range_extra_pct: f64,
+) -> PredictionRange {
+    let mut predicted_port = nat.predicted_port;
+    if matches!(prediction_mode, PredictionMode::Delta) {
+        let predicted = (peer_local_port as f64 + nat.delta_median).round() as i32;
+        predicted_port = clamp_port(predicted);
+    }
+    if predicted_port == 0 {
+        predicted_port = peer_local_port;
+    }
+
+    let mut scan_start = predicted_port as i32 - nat.error_range as i32;
+    let mut scan_end = predicted_port as i32 + nat.error_range as i32;
+    scan_start = scan_start.max(MIN_PORT as i32);
+    scan_end = scan_end.min(MAX_PORT as i32);
+
+    if nat.pattern_type == "random_like" && nat.min_port > 0 && nat.max_port >= nat.min_port {
+        scan_start = nat.min_port as i32;
+        scan_end = nat.max_port as i32;
+    }
+
+    let (scan_start, scan_end) = apply_range_extra(scan_start, scan_end, prediction_range_extra_pct);
+    let needs_scan = scan_end > scan_start;
+
+    PredictionRange {
+        predicted_port,
+        scan_start: scan_start as u16,
+        scan_end: scan_end as u16,
+        needs_scan,
+        pattern_type: nat.pattern_type.clone(),
+        min_port: nat.min_port,
+    }
+}
+fn prediction_range_from_analysis(peer_local_port: u16, nat: &NATAnalysis) -> PredictionRange {
+    let mut predicted_port = nat.predicted_port;
+    if predicted_port == 0 {
+        predicted_port = peer_local_port;
+    }
+    if predicted_port == 0 && nat.scan_start > 0 {
+        predicted_port = nat.scan_start;
+    }
+
+    let mut scan_start = nat.scan_start;
+    let mut scan_end = nat.scan_end;
+    if scan_start == 0 && scan_end == 0 {
+        scan_start = predicted_port;
+        scan_end = predicted_port;
+    }
+
+    let needs_scan = nat.needs_scan && scan_end > scan_start;
+
+    PredictionRange {
+        predicted_port,
+        scan_start,
+        scan_end,
+        needs_scan,
+        pattern_type: nat.pattern_type.clone(),
+        min_port: nat.min_port,
+    }
+}
+
+
+fn build_candidate_ports(range: &PredictionRange, max_ports: usize) -> Vec<u16> {
+    if !range.needs_scan {
+        return Vec::new();
+    }
+    if range.scan_end < range.scan_start {
+        return Vec::new();
+    }
+
+    if range.pattern_type == "random_like" {
+        let mut ports = Vec::new();
+        let mut seen = HashSet::new();
+
+        let add_port = |port: u16, ports: &mut Vec<u16>, seen: &mut HashSet<u16>| {
+            if port < range.scan_start || port > range.scan_end {
+                return;
+            }
+            if seen.insert(port) {
+                ports.push(port);
+            }
+        };
+
+        if range.predicted_port > 0 {
+            add_port(range.predicted_port, &mut ports, &mut seen);
+        }
+
+        let base = range.min_port;
+        for delta in 1..=5u16 {
+            add_port(base.saturating_add(delta), &mut ports, &mut seen);
+        }
+
+        let remaining = max_ports.saturating_sub(ports.len());
+        if remaining > 0 {
+            let span = range.scan_end - range.scan_start;
+            let step = if span > 0 {
+                std::cmp::max(1, (span as usize) / remaining)
+            } else {
+                1
+            };
+            let mut p = range.scan_start;
+            while p <= range.scan_end && ports.len() < max_ports {
+                add_port(p, &mut ports, &mut seen);
+                p = p.saturating_add(step as u16);
+            }
+        }
+
+        return ports;
+    }
+
+    let total = (range.scan_end - range.scan_start + 1) as usize;
+    if total <= max_ports {
+        return (range.scan_start..=range.scan_end).collect();
+    }
+
+    let predicted = if range.predicted_port != 0 {
+        range.predicted_port
+    } else {
+        range.scan_start + (range.scan_end - range.scan_start) / 2
+    };
+
+    let half = max_ports / 2;
+    let mut window_start = predicted.saturating_sub(half as u16);
+    if window_start < range.scan_start {
+        window_start = range.scan_start;
+    }
+    let mut window_end = window_start + max_ports as u16 - 1;
+    if window_end > range.scan_end {
+        window_end = range.scan_end;
+        window_start = window_end.saturating_sub(max_ports as u16 - 1);
+        if window_start < range.scan_start {
+            window_start = range.scan_start;
+        }
+    }
+
+    (window_start..=window_end).collect()
+}
+
+fn build_peer_addresses_for_conn(
+    peer_ip: &str,
+    peer_public_port: u16,
+    peer_local_port: u16,
+    prediction_mode: PredictionMode,
+    prediction_range_extra_pct: f64,
+    nat: Option<&NATAnalysis>,
+    port_analysis: Option<&NATAnalysis>,
+    include_public_port: bool,
+) -> Vec<PeerAddress> {
+    let mut addresses = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut add_port = |port: u16, addr_type: &str| {
+        if seen.insert(port) {
+            addresses.push(PeerAddress {
+                ip: peer_ip.to_string(),
+                port,
+                addr_type: addr_type.to_string(),
+            });
+        }
+    };
+
+    if include_public_port {
+        add_port(peer_public_port, "public");
+    }
+
+    if let Some(nat) = port_analysis {
+        let range = prediction_range_from_analysis(peer_local_port, nat);
+        if range.predicted_port > 0 {
+            add_port(range.predicted_port, "predicted");
+        }
+        if peer_local_port != peer_public_port {
+            add_port(peer_local_port, "public_local_port");
+        }
+        if range.needs_scan {
+            for port in build_candidate_ports(&range, MAX_SCAN_PORTS) {
+                add_port(port, "predicted_range");
+            }
+        }
+    } else if let Some(nat) = nat {
+        let range = compute_prediction_range(peer_local_port, nat, prediction_mode, prediction_range_extra_pct);
+        if range.predicted_port > 0 {
+            add_port(range.predicted_port, "predicted");
+        }
+        if peer_local_port != peer_public_port {
+            add_port(peer_local_port, "public_local_port");
+        }
+        if range.needs_scan {
+            for port in build_candidate_ports(&range, MAX_SCAN_PORTS) {
+                add_port(port, "predicted_range");
+            }
+        }
+    } else if peer_local_port != peer_public_port {
+        add_port(peer_local_port, "public_local_port");
+    }
+
+    addresses
+}
+
+fn apply_scan_budget(lists: Vec<Vec<PeerAddress>>, budget: u32) -> Result<Vec<Vec<PeerAddress>>> {
+    if budget == 0 {
+        return Ok(lists);
+    }
+
+    let total_conns = lists.len();
+    if total_conns == 0 {
+        return Ok(lists);
+    }
+
+    for list in &lists {
+        if list.is_empty() {
+            return Err(anyhow!("No candidate ports available for one connection"));
+        }
+    }
+
+    if budget < total_conns as u32 {
+        return Err(anyhow!("scan_budget too low for {} connections", total_conns));
+    }
+
+    let mut result: Vec<Vec<PeerAddress>> = vec![Vec::new(); total_conns];
+    let mut indices = vec![0usize; total_conns];
+    let mut used = 0u32;
+
+    for i in 0..total_conns {
+        result[i].push(lists[i][0].clone());
+        indices[i] = 1;
+        used += 1;
+    }
+
+    while used < budget {
+        let mut progressed = false;
+        for i in 0..total_conns {
+            if used >= budget {
+                break;
+            }
+            if indices[i] < lists[i].len() {
+                result[i].push(lists[i][indices[i]].clone());
+                indices[i] += 1;
+                used += 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    Ok(result)
+}
+
+fn collect_local_ports(total_conns: u8, control_port: u16) -> Result<Vec<u16>> {
+    let mut ports = Vec::with_capacity(total_conns as usize);
+    let mut seen = HashSet::new();
+    seen.insert(control_port);
+    ports.push(control_port);
+
+    while ports.len() < total_conns as usize {
+        let port = get_free_port()?;
+        if seen.insert(port) {
+            ports.push(port);
+        }
+    }
+
+    Ok(ports)
+}
+
 /// Connect to relay server and handle the full protocol
 async fn run_relay_protocol(
     server_addr: &str,
     session_id: &str,
     role: &str,
     local_port: u16,
+    local_ports: Option<&[u16]>,
+    tcp_connections: u8,
     _timeout: Duration,
     probe_count: u32,
     prediction_mode: PredictionMode,
@@ -310,12 +650,23 @@ async fn run_relay_protocol(
     let mut reader = BufReader::new(reader);
     
     // Send registration
+    let local_ports_payload = local_ports
+        .map(|ports| ports.to_vec())
+        .filter(|ports| !ports.is_empty());
+    let tcp_connections_payload = if tcp_connections > 1 {
+        Some(tcp_connections)
+    } else {
+        None
+    };
+
     let register = RegisterMessage::new(
         session_id,
         role,
         local_port,
         Some(prediction_mode.as_str().to_string()),
         Some(prediction_range_extra_pct),
+        tcp_connections_payload,
+        local_ports_payload,
     );
     let msg = serde_json::to_string(&register)? + "\n";
     writer.write_all(msg.as_bytes()).await?;
@@ -332,6 +683,8 @@ async fn run_relay_protocol(
     let mut session = Session {
         peer_public_addr: None,
         peer_addresses: vec![],
+        peer_nat_analysis: None,
+        peer_port_analyses: None,
         same_network: false,
         start_at: None,
         time_offset: 0.0,
@@ -420,7 +773,7 @@ async fn run_relay_protocol(
                 }
             }
             
-            RelayMessage::PeerInfo { peer_public_addr, peer_local_port, peer_addresses, your_role: _, same_network, peer_nat_analysis } => {
+            RelayMessage::PeerInfo { peer_public_addr, peer_local_port, peer_addresses, your_role: _, same_network, peer_nat_analysis, peer_port_analyses } => {
                 if let Some((ip, port)) = RelayMessage::parse_addr(&peer_public_addr) {
                     let addr: SocketAddr = format!("{}:{}", ip, port).parse()?;
                     session.peer_public_addr = Some(addr);
@@ -428,6 +781,25 @@ async fn run_relay_protocol(
                         .map(|pa| pa.into())
                         .collect();
                     session.same_network = same_network;
+                    session.peer_nat_analysis = peer_nat_analysis.clone();
+                    session.peer_port_analyses = peer_port_analyses.clone();
+                    if let Some(port_analyses) = &peer_port_analyses {
+                        debug!("Peer per-port NAT analyses: {}", port_analyses.len());
+                        for entry in port_analyses {
+                            let nat = &entry.nat_analysis;
+                            debug!(
+                                "  local_port={} pattern={} predicted={} error={} scan={}..{} needs_scan={} range={}",
+                                entry.local_port,
+                                nat.pattern_type,
+                                nat.predicted_port,
+                                nat.error_range,
+                                nat.scan_start,
+                                nat.scan_end,
+                                nat.needs_scan,
+                                nat.port_range,
+                            );
+                        }
+                    }
                     
                     let addr_count = session.peer_addresses.len();
                     
@@ -495,7 +867,10 @@ async fn run_sender(
     probe_count: u32,
     prediction_mode: PredictionMode,
     prediction_range_extra_pct: f64,
+    tcp_connections: u8,
+    scan_budget: u32,
 ) -> Result<()> {
+    debug!("Multi-TCP: connections={} scan_budget={}", tcp_connections, scan_budget);
     // FIRST: Calculate SHA256 BEFORE connecting to relay
     // This can take a long time for large files, and we don't want to
     // block the other peer or timeout while hashing
@@ -504,7 +879,24 @@ async fn run_sender(
     info!("SHA256: {}", transfer::sha256_to_hex(&sha256));
     info!("File size: {:.2} MB", file_size as f64 / (1024.0 * 1024.0));
     info!("");
+
+    if tcp_connections > 1 {
+        return run_sender_multi(
+            server_addr,
+            session_id,
+            file_path,
+            file_size,
+            sha256,
+            timeout,
+            probe_count,
+            prediction_mode,
+            prediction_range_extra_pct,
+            tcp_connections,
+            scan_budget,
+        ).await;
+    }
     
+    debug!("Multi-TCP: connections={} scan_budget={}", tcp_connections, scan_budget);
     // Get local port for hole punching
     let local_port = get_free_port()?;
     info!("Using local port: {}", local_port);
@@ -515,6 +907,8 @@ async fn run_sender(
         session_id,
         "sender",
         local_port,
+        None,
+        tcp_connections,
         timeout,
         probe_count,
         prediction_mode,
@@ -564,7 +958,22 @@ async fn run_receiver(
     probe_count: u32,
     prediction_mode: PredictionMode,
     prediction_range_extra_pct: f64,
+    tcp_connections: u8,
+    scan_budget: u32,
 ) -> Result<()> {
+    if tcp_connections > 1 {
+        return run_receiver_multi(
+            server_addr,
+            session_id,
+            timeout,
+            probe_count,
+            prediction_mode,
+            prediction_range_extra_pct,
+            tcp_connections,
+            scan_budget,
+        ).await;
+    }
+
     // Get local port for hole punching
     let local_port = get_free_port()?;
     info!("Using local port: {}", local_port);
@@ -575,6 +984,8 @@ async fn run_receiver(
         session_id,
         "receiver",
         local_port,
+        None,
+        tcp_connections,
         timeout,
         probe_count,
         prediction_mode,
@@ -613,6 +1024,308 @@ async fn run_receiver(
     receiver.run().await
 }
 
+
+async fn run_sender_multi(
+    server_addr: &str,
+    session_id: &str,
+    file_path: &str,
+    file_size: u64,
+    sha256: [u8; 32],
+    timeout: Duration,
+    probe_count: u32,
+    prediction_mode: PredictionMode,
+    prediction_range_extra_pct: f64,
+    tcp_connections: u8,
+    scan_budget: u32,
+) -> Result<()> {
+    info!("Multi-TCP enabled with {} connections", tcp_connections);
+
+    let control_port = get_free_port()?;
+    let local_ports = collect_local_ports(tcp_connections, control_port)?;
+    info!("Using control port: {}", control_port);
+
+    let (_relay_stream, session) = run_relay_protocol(
+        server_addr,
+        session_id,
+        "sender",
+        control_port,
+        Some(&local_ports),
+        tcp_connections,
+        timeout,
+        probe_count,
+        prediction_mode,
+        prediction_range_extra_pct,
+    ).await?;
+
+    let peer_addr = session.peer_public_addr
+        .ok_or_else(|| anyhow!("No peer address received"))?;
+    let relay_start_at = session.start_at
+        .ok_or_else(|| anyhow!("No start_at received"))?;
+
+    let config = HolePunchConfig {
+        local_port: control_port,
+        peer_primary_addr: peer_addr,
+        peer_addresses: session.peer_addresses,
+        start_at: relay_start_at,
+        timeout,
+        same_network: session.same_network,
+        time_offset: session.time_offset,
+    };
+
+    let mut control_stream = match do_hole_punch(config).await? {
+        HolePunchResult::Success(stream) => stream,
+        HolePunchResult::Timeout => {
+            return Err(anyhow!("Hole punch timed out - could not establish control connection"));
+        }
+    };
+
+    info!("Control connection established");
+
+    let start_at = current_timestamp() + MULTI_START_DELAY_SEC;
+    let retry_limit = 3u8;
+
+    let peer_local_ports = multi_handshake_sender(
+        &mut control_stream,
+        tcp_connections,
+        retry_limit,
+        start_at,
+        &local_ports,
+    ).await?;
+
+    let peer_ip = peer_addr.ip().to_string();
+    let peer_public_port = peer_addr.port();
+    let nat = session.peer_nat_analysis.as_ref();
+
+    let mut candidate_lists = Vec::new();
+    let mut conn_ids = Vec::new();
+    for conn_id in 1..tcp_connections {
+        let peer_local_port = *peer_local_ports
+            .get(conn_id as usize)
+            .ok_or_else(|| anyhow!("Missing peer local port for conn_id {}", conn_id))?;
+        let port_analysis = session
+            .peer_port_analyses
+            .as_ref()
+            .and_then(|items| items.iter().find(|item| item.local_port == peer_local_port))
+            .map(|item| &item.nat_analysis);
+        let candidates = build_peer_addresses_for_conn(
+            &peer_ip,
+            peer_public_port,
+            peer_local_port,
+            prediction_mode,
+            prediction_range_extra_pct,
+            nat,
+            port_analysis,
+            false,
+        );
+        candidate_lists.push(candidates);
+        conn_ids.push(conn_id);
+    }
+
+    let candidate_lists = apply_scan_budget(candidate_lists, scan_budget)?;
+
+    let mut configs = Vec::new();
+    for (idx, conn_id) in conn_ids.iter().enumerate() {
+        let list = &candidate_lists[idx];
+        if list.is_empty() {
+            return Err(anyhow!("No candidate ports for conn_id {}", conn_id));
+        }
+        let primary = list[0].to_socket_addr()?;
+        let extras = list[1..].to_vec();
+        let config = HolePunchConfig {
+            local_port: local_ports[*conn_id as usize],
+            peer_primary_addr: primary,
+            peer_addresses: extras,
+            start_at,
+            timeout,
+            same_network: session.same_network,
+            time_offset: 0.0,
+        };
+        configs.push((*conn_id, config));
+    }
+
+    let mut extra_streams = Vec::new();
+    if !configs.is_empty() {
+        extra_streams = hole_punch::do_hole_punch_multi(configs, retry_limit).await?;
+        for (conn_id, stream) in extra_streams.iter_mut() {
+            multi_hello_sender(stream, tcp_connections, *conn_id).await?;
+        }
+    }
+
+    for conn_id in 0..tcp_connections {
+        send_multi_ready(&mut control_stream, conn_id).await?;
+    }
+
+    let mut ready = HashSet::new();
+    while ready.len() < tcp_connections as usize {
+        let conn_id = tokio::time::timeout(Duration::from_secs(30), read_multi_ready(&mut control_stream)).await
+            .map_err(|_| anyhow!("Timeout waiting for MULTI_READY"))??;
+        ready.insert(conn_id);
+    }
+
+    send_multi_start(&mut control_stream).await?;
+
+    let mut streams: Vec<Option<TcpStream>> = Vec::with_capacity(tcp_connections as usize);
+    streams.resize_with(tcp_connections as usize, || None);
+    streams[0] = Some(control_stream);
+    for (conn_id, stream) in extra_streams {
+        if let Some(slot) = streams.get_mut(conn_id as usize) {
+            *slot = Some(stream);
+        }
+    }
+
+    let mut final_streams = Vec::new();
+    for (idx, item) in streams.into_iter().enumerate() {
+        let stream = item.ok_or_else(|| anyhow!("Missing stream for conn_id {}", idx))?;
+        final_streams.push(stream);
+    }
+
+    let mut sender = MultiSender::new_with_hash(final_streams, file_path, file_size, sha256);
+    sender.run().await
+}
+
+async fn run_receiver_multi(
+    server_addr: &str,
+    session_id: &str,
+    timeout: Duration,
+    probe_count: u32,
+    prediction_mode: PredictionMode,
+    prediction_range_extra_pct: f64,
+    tcp_connections: u8,
+    scan_budget: u32,
+) -> Result<()> {
+    info!("Multi-TCP enabled with {} connections", tcp_connections);
+
+    let control_port = get_free_port()?;
+    let local_ports = collect_local_ports(tcp_connections, control_port)?;
+    info!("Using control port: {}", control_port);
+
+    let (_relay_stream, session) = run_relay_protocol(
+        server_addr,
+        session_id,
+        "receiver",
+        control_port,
+        Some(&local_ports),
+        tcp_connections,
+        timeout,
+        probe_count,
+        prediction_mode,
+        prediction_range_extra_pct,
+    ).await?;
+
+    let peer_addr = session.peer_public_addr
+        .ok_or_else(|| anyhow!("No peer address received"))?;
+    let relay_start_at = session.start_at
+        .ok_or_else(|| anyhow!("No start_at received"))?;
+
+    let config = HolePunchConfig {
+        local_port: control_port,
+        peer_primary_addr: peer_addr,
+        peer_addresses: session.peer_addresses,
+        start_at: relay_start_at,
+        timeout,
+        same_network: session.same_network,
+        time_offset: session.time_offset,
+    };
+
+    let mut control_stream = match do_hole_punch(config).await? {
+        HolePunchResult::Success(stream) => stream,
+        HolePunchResult::Timeout => {
+            return Err(anyhow!("Hole punch timed out - could not establish control connection"));
+        }
+    };
+
+    info!("Control connection established");
+
+    let plan = multi_handshake_receiver(&mut control_stream, tcp_connections, &local_ports).await?;
+    let start_at = plan.start_at;
+    let retry_limit = plan.retry_limit;
+    let peer_local_ports = plan.peer_local_ports;
+
+    let peer_ip = peer_addr.ip().to_string();
+    let peer_public_port = peer_addr.port();
+    let nat = session.peer_nat_analysis.as_ref();
+
+    let mut candidate_lists = Vec::new();
+    let mut conn_ids = Vec::new();
+    for conn_id in 1..tcp_connections {
+        let peer_local_port = *peer_local_ports
+            .get(conn_id as usize)
+            .ok_or_else(|| anyhow!("Missing peer local port for conn_id {}", conn_id))?;
+        let port_analysis = session
+            .peer_port_analyses
+            .as_ref()
+            .and_then(|items| items.iter().find(|item| item.local_port == peer_local_port))
+            .map(|item| &item.nat_analysis);
+        let candidates = build_peer_addresses_for_conn(
+            &peer_ip,
+            peer_public_port,
+            peer_local_port,
+            prediction_mode,
+            prediction_range_extra_pct,
+            nat,
+            port_analysis,
+            false,
+        );
+        candidate_lists.push(candidates);
+        conn_ids.push(conn_id);
+    }
+
+    let candidate_lists = apply_scan_budget(candidate_lists, scan_budget)?;
+
+    let mut configs = Vec::new();
+    for (idx, conn_id) in conn_ids.iter().enumerate() {
+        let list = &candidate_lists[idx];
+        if list.is_empty() {
+            return Err(anyhow!("No candidate ports for conn_id {}", conn_id));
+        }
+        let primary = list[0].to_socket_addr()?;
+        let extras = list[1..].to_vec();
+        let config = HolePunchConfig {
+            local_port: local_ports[*conn_id as usize],
+            peer_primary_addr: primary,
+            peer_addresses: extras,
+            start_at,
+            timeout,
+            same_network: session.same_network,
+            time_offset: 0.0,
+        };
+        configs.push((*conn_id, config));
+    }
+
+    let mut extra_streams = Vec::new();
+    if !configs.is_empty() {
+        extra_streams = hole_punch::do_hole_punch_multi(configs, retry_limit).await?;
+        for (conn_id, stream) in extra_streams.iter_mut() {
+            multi_hello_receiver(stream, tcp_connections, *conn_id).await?;
+        }
+    }
+
+    for conn_id in 0..tcp_connections {
+        send_multi_ready(&mut control_stream, conn_id).await?;
+    }
+
+    tokio::time::timeout(Duration::from_secs(30), read_multi_start(&mut control_stream)).await
+        .map_err(|_| anyhow!("Timeout waiting for MULTI_START"))??;
+
+    let mut streams: Vec<Option<TcpStream>> = Vec::with_capacity(tcp_connections as usize);
+    streams.resize_with(tcp_connections as usize, || None);
+    streams[0] = Some(control_stream);
+    for (conn_id, stream) in extra_streams {
+        if let Some(slot) = streams.get_mut(conn_id as usize) {
+            *slot = Some(stream);
+        }
+    }
+
+    let mut final_streams = Vec::new();
+    for (idx, item) in streams.into_iter().enumerate() {
+        let stream = item.ok_or_else(|| anyhow!("Missing stream for conn_id {}", idx))?;
+        final_streams.push(stream);
+    }
+
+    let mut receiver = MultiReceiver::new(final_streams);
+    receiver.run().await
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -644,11 +1357,24 @@ async fn main() -> Result<()> {
     
     info!("TCP File Transfer Client v{} (ICE)", APP_VERSION);
     info!("===================================");
+    info!("TCP connections: {}", args.tcp_connections);
+    if args.tcp_connections > 1 {
+        if args.scan_budget == 0 {
+            info!("Scan budget: unlimited");
+        } else {
+            info!("Scan budget: {}", args.scan_budget);
+        }
+    }
     debug!("Chunk: {} KB | Buffer: 8MB | TCP Buffer: 16MB", chunk_size / 1024);
     
     // Validate arguments
     if matches!(args.mode, Mode::Send) && args.file.is_none() {
         return Err(anyhow!("--file required for send mode"));
+    }
+    
+    let allowed_connections = [1u8, 2, 4, 8];
+    if !allowed_connections.contains(&args.tcp_connections) {
+        return Err(anyhow!("--tcp-connections must be one of 1,2,4,8"));
     }
     
     let timeout = Duration::from_secs(args.timeout);
@@ -683,6 +1409,8 @@ async fn main() -> Result<()> {
                 args.probe_count,
                 args.prediction_mode,
                 args.prediction_range_extra_pct,
+                args.tcp_connections,
+                args.scan_budget,
             ).await
         }
         Mode::Receive => {
@@ -697,6 +1425,8 @@ async fn main() -> Result<()> {
                 args.probe_count,
                 args.prediction_mode,
                 args.prediction_range_extra_pct,
+                args.tcp_connections,
+                args.scan_budget,
             ).await
         }
     }
@@ -718,8 +1448,6 @@ async fn run_probe_debug(server_addr: &str, session_id: &str, count: u32) -> Res
     }
 
     struct ProbeSample {
-        idx: u32,
-        local_port: u16,
         nat_port: u16,
         delta: i32,
     }
@@ -753,7 +1481,7 @@ async fn run_probe_debug(server_addr: &str, session_id: &str, count: u32) -> Res
                         let nat_port = v.get("your_nat_port").and_then(|p| p.as_u64())
                             .ok_or_else(|| anyhow!("probe_ack missing your_nat_port"))? as u16;
                         let delta = nat_port as i32 - local_port as i32;
-                        samples.push(ProbeSample { idx: i, local_port, nat_port, delta });
+                        samples.push(ProbeSample { nat_port, delta });
                     }
                     _ => {
                         failures += 1;
@@ -773,14 +1501,9 @@ async fn run_probe_debug(server_addr: &str, session_id: &str, count: u32) -> Res
         return Ok(());
     }
 
-    println!("{:<4} {:>6} {:>6} {:>7}", "#", "local", "nat", "delta");
-    println!("{:-<4} {:-<6} {:-<6} {:-<7}", "", "", "", "");
-    for s in &samples {
-        println!("{:<4} {:>6} {:>6} {:+7}", s.idx, s.local_port, s.nat_port, s.delta);
-    }
-    println!();
+    println!("Samples received: {}", samples.len());
 
-    let mut nat_ports: Vec<u16> = samples.iter().map(|s| s.nat_port).collect();
+    let nat_ports: Vec<u16> = samples.iter().map(|s| s.nat_port).collect();
     let mut deltas: Vec<i32> = samples.iter().map(|s| s.delta).collect();
 
     let min_nat = *nat_ports.iter().min().unwrap();
@@ -798,7 +1521,6 @@ async fn run_probe_debug(server_addr: &str, session_id: &str, count: u32) -> Res
     let stdev_delta = var_delta.sqrt();
 
     let unique_nat: HashSet<u16> = nat_ports.iter().cloned().collect();
-    nat_ports.sort_unstable();
 
     println!("NAT ports: min={} max={} range={} unique={}", min_nat, max_nat, range_nat, unique_nat.len());
     println!("Delta: min={} max={} median={:.1} stdev={:.2}", min_delta, max_delta, median_delta, stdev_delta);
@@ -825,12 +1547,6 @@ async fn run_probe_debug(server_addr: &str, session_id: &str, count: u32) -> Res
     println!("Estimated NAT type: {}", nat_type);
     println!();
 
-    let mut deltas_sorted = deltas;
-    deltas_sorted.sort_unstable();
-    let delta_list = deltas_sorted.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ");
-
-    println!("Delta (sorted): {}", delta_list);
-    println!();
     if failures > 0 {
         println!("Probe failures: {}/{}", failures, count);
     }
