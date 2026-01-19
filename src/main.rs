@@ -763,14 +763,33 @@ async fn run_probe_debug(server_addr: &str, session_id: &str, count: u32) -> Res
 
     println!("NAT ports: min={} max={} range={} unique={}", min_nat, max_nat, range_nat, unique_nat.len());
     println!("Delta: min={} max={} median={:.1} stdev={:.2}", min_delta, max_delta, median_delta, stdev_delta);
+    let max_dev = deltas.iter()
+        .map(|d| ((*d as f64) - median_delta).abs())
+        .fold(0.0, f64::max);
+    let jitter = (stdev_delta * 2.0).round().max(2.0);
+    let error_range = (max_dev + jitter).round() as i32;
+    let delta_spread = max_delta - min_delta;
+    let port_preserved = samples.iter().all(|s| s.delta == 0);
+    let nat_type = if port_preserved {
+        "port_preserved"
+    } else if delta_spread == 0 {
+        "constant_delta"
+    } else if error_range <= 5 {
+        "small_delta_range"
+    } else if error_range <= 30 {
+        "medium_delta_range"
+    } else if error_range <= 100 {
+        "large_delta_range"
+    } else {
+        "random_like"
+    };
+    println!("Estimated NAT type: {}", nat_type);
     println!();
 
-    let nat_list = nat_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
     let mut deltas_sorted = deltas;
     deltas_sorted.sort_unstable();
     let delta_list = deltas_sorted.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ");
 
-    println!("NAT ports (sorted): {}", nat_list);
     println!("Delta (sorted): {}", delta_list);
     println!();
     if failures > 0 {
