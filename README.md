@@ -64,6 +64,9 @@ You can also expand the scan range with `--prediction-range-extra-pct` (applies 
 The value is a percentage of the computed scan span and is split across both sides of the
 window. Example: a range of 100..200 with 5 expands to 98..203, and the final candidate
 list is still capped by `MAX_SCAN_PORTS`.
+In practice, this can yield significantly better results when the true NAT ports sit within
+a wider band than the probe-derived window. If delta or external prediction is too tight,
+raising this to around 20-50 can materially improve success rates.
 
 ## Usage
 
