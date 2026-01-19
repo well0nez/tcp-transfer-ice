@@ -60,6 +60,10 @@ using local-port deltas. This can help when symmetric/random NATs allocate ports
 - Pros: Can stabilize prediction when local-port deltas are noisy or misleading.
 - Cons: Ignores local-port correlation; may reduce accuracy on stable delta NATs.
 
+You can also bias the prediction center with `--prediction-bias-pct` (applies to both modes).
+Positive values push the predicted port upward; negative values shift it downward. Large
+percentages can overshoot the actual NAT port, so use with care.
+
 ## Usage
 
 ### Prerequisites
@@ -101,6 +105,7 @@ Options:
       --timeout <SECONDS>    Hole punch timeout [default: 30]
       --probe-count <N>      NAT probe connection count [default: 10]
       --prediction-mode <MODE>  NAT prediction mode: delta or external [default: delta]
+      --prediction-bias-pct <PCT>  Bias prediction center by percentage [default: 0]
       --debug                Enable debug logging
   -h, --help                 Print help
   -V, --version              Print version

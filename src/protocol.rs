@@ -24,6 +24,8 @@ pub struct RegisterMessage {
     pub private_ip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prediction_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prediction_bias_pct: Option<f64>,
 }
 
 impl RegisterMessage {
@@ -32,6 +34,7 @@ impl RegisterMessage {
         role: &str,
         local_port: u16,
         prediction_mode: Option<String>,
+        prediction_bias_pct: Option<f64>,
     ) -> Self {
         Self {
             msg_type: "register".to_string(),
@@ -40,6 +43,7 @@ impl RegisterMessage {
             local_port,
             private_ip: get_private_ip(),
             prediction_mode,
+            prediction_bias_pct,
         }
     }
 }

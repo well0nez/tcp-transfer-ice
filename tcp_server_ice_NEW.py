@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 MIN_PORT = 1024
 MAX_PORT = 65535
-MAX_SCAN_PORTS = 128
+MAX_SCAN_PORTS = 512
 PREDICTION_DELAY_SEC = 2.0
 RATE_DAMPING = 0.5
 MAX_RATE_SHIFT = 32
@@ -108,6 +108,7 @@ class Peer:
     probes_done: bool = False  # True when probing phase complete
     needs_probing: bool = False  # True if NAT port changed (not preserved)
     prediction_mode: str = "delta"  # delta or external
+    prediction_bias_pct: float = 0.0  # percent bias applied to prediction
 
 
 class TCPRelayServerICE:
@@ -212,6 +213,7 @@ class TCPRelayServerICE:
         probes: List[Tuple[str, int, int, float]],
         target_local_port: int,
         prediction_mode: str,
+        prediction_bias_pct: float,
     ) -> NATAnalysis:
         """Analyze NAT behavior and predict the peer-facing port range."""
         analysis = NATAnalysis()
@@ -250,9 +252,13 @@ class TCPRelayServerICE:
             logger.info("NAT Analysis: port preserved (no scan needed)")
             return analysis
 
+        if prediction_bias_pct != 0.0:
+            logger.info("NAT Analysis: applying prediction bias %.2f%%", prediction_bias_pct)
+
         if use_external:
             mean_port = statistics.mean(analysis.probed_ports)
-            predicted = int(round(mean_port))
+            biased_mean = mean_port * (1.0 + (prediction_bias_pct / 100.0))
+            predicted = int(round(biased_mean))
             analysis.predicted_port = max(MIN_PORT, min(MAX_PORT, predicted))
 
             max_dev = max(abs(p - mean_port) for p in analysis.probed_ports)
@@ -275,7 +281,8 @@ class TCPRelayServerICE:
             analysis.delta_median = statistics.median(deltas)
             analysis.delta_stdev = statistics.pstdev(deltas) if len(deltas) > 1 else 0.0
 
-            predicted = int(round(target_local_port + analysis.delta_median))
+            adjusted_delta = analysis.delta_median * (1.0 + (prediction_bias_pct / 100.0))
+            predicted = int(round(target_local_port + adjusted_delta))
             analysis.predicted_port = max(MIN_PORT, min(MAX_PORT, predicted))
 
             max_dev = max(abs(d - analysis.delta_median) for d in deltas)
@@ -398,6 +405,12 @@ class TCPRelayServerICE:
             if prediction_mode not in ('delta', 'external'):
                 logger.warning(f"Unknown prediction_mode '{prediction_mode}', defaulting to 'delta'")
                 prediction_mode = 'delta'
+            bias_raw = msg.get('prediction_bias_pct', 0.0)
+            try:
+                prediction_bias_pct = float(bias_raw)
+            except (TypeError, ValueError):
+                logger.warning(f"Invalid prediction_bias_pct '{bias_raw}', defaulting to 0.0")
+                prediction_bias_pct = 0.0
             
             if role not in ('sender', 'receiver'):
                 await self.send_error(writer, f"Invalid role: {role}")
@@ -412,6 +425,7 @@ class TCPRelayServerICE:
                 session_id=session_id,
                 private_ip=private_ip,
                 prediction_mode=prediction_mode,
+                prediction_bias_pct=prediction_bias_pct,
             )
             
             lock = self.get_session_lock(session_id)
@@ -507,6 +521,7 @@ class TCPRelayServerICE:
                         peer_probes,
                         peer.local_port,
                         peer.prediction_mode,
+                        peer.prediction_bias_pct,
                     )
                     # Clear used probes
                     self.pending_probes[session_id] = [
@@ -589,6 +604,7 @@ class TCPRelayServerICE:
                     peer_probes,
                     peer.local_port,
                     peer.prediction_mode,
+                    peer.prediction_bias_pct,
                 )
                 # Clear used probes
                 self.pending_probes[session_id] = [
