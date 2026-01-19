@@ -41,15 +41,34 @@ The relay server runs a short NAT probing phase when a peer does not preserve po
 These additions (rate-based forward shift and sparse random-like sampling) extend the standard delta-only
 prediction and reduce the number of attempts without a full port sweep.
 
+### Scan Cap (MAX_SCAN_PORTS)
+
+You can raise the scan cap with `--max-scan-ports`. Higher values can improve success on symmetric/random
+NAT because the peer-specific NAT port may lie outside the small probe-derived range. The tradeoffs:
+
+- Pros: Higher success probability when NAT port allocation is wide or target-dependent.
+- Cons: More outbound connection attempts, higher CPU/network load, and potential throttling by NATs/ISPs.
+
+In our tests, setting `--max-scan-ports 512` reached roughly 99% success on difficult NAT pairs, but
+results depend on the networks and devices involved.
+
 ## Usage
 
 ### Prerequisites
 
 Start the relay server:
 ```bash
-python3 tcp_server_ice_NEW.py --port 9999 --probe-port 9998
+python3 tcp_server_ice_NEW.py --port 9999 --probe-port 9998 --max-scan-ports 512
 ```
 Ensure both ports are reachable from the public Internet.
+
+Relay server options:
+```
+  --host <HOST>             Host to bind to [default: 0.0.0.0]
+  --port <PORT>             Main port [default: 9999]
+  --probe-port <PORT>       Probe port for NAT analysis [default: 9998]
+  --max-scan-ports <N>      Max candidate ports sent to clients [default: 128]
+```
 
 ### Receiver (start first)
 

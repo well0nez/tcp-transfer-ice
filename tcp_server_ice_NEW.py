@@ -112,10 +112,17 @@ class Peer:
 class TCPRelayServerICE:
     """TCP Hole Punch Relay Server with NAT Probing"""
     
-    def __init__(self, host: str = '0.0.0.0', port: int = 9999, probe_port: int = 9998):
+    def __init__(
+        self,
+        host: str = '0.0.0.0',
+        port: int = 9999,
+        probe_port: int = 9998,
+        max_scan_ports: int = MAX_SCAN_PORTS,
+    ):
         self.host = host
         self.port = port
         self.probe_port = probe_port
+        self.max_scan_ports = max(1, max_scan_ports)
         self.sessions: Dict[str, Dict[str, Peer]] = {}
         self.session_locks: Dict[str, asyncio.Lock] = {}
         # Probe connections waiting to be claimed
@@ -662,28 +669,28 @@ class TCPRelayServerICE:
             for delta in (1, 2, 3, 4, 5):
                 add_port(base + delta)
 
-            remaining = MAX_SCAN_PORTS - len(ports)
+            remaining = self.max_scan_ports - len(ports)
             if remaining > 0:
                 span = analysis.scan_end - analysis.scan_start
                 step = max(1, span // remaining) if span > 0 else 1
                 p = analysis.scan_start
-                while p <= analysis.scan_end and len(ports) < MAX_SCAN_PORTS:
+                while p <= analysis.scan_end and len(ports) < self.max_scan_ports:
                     add_port(p)
                     p += step
 
             return ports
 
         total = analysis.scan_end - analysis.scan_start + 1
-        if total <= MAX_SCAN_PORTS:
+        if total <= self.max_scan_ports:
             return list(range(analysis.scan_start, analysis.scan_end + 1))
 
         predicted = analysis.predicted_port or ((analysis.scan_start + analysis.scan_end) // 2)
-        half = MAX_SCAN_PORTS // 2
+        half = self.max_scan_ports // 2
         window_start = max(analysis.scan_start, predicted - half)
-        window_end = window_start + MAX_SCAN_PORTS - 1
+        window_end = window_start + self.max_scan_ports - 1
         if window_end > analysis.scan_end:
             window_end = analysis.scan_end
-            window_start = max(analysis.scan_start, window_end - MAX_SCAN_PORTS + 1)
+            window_start = max(analysis.scan_start, window_end - self.max_scan_ports + 1)
         return list(range(window_start, window_end + 1))
     
     def get_peer_addresses_with_prediction(self, peer: Peer, other: Peer) -> List[Dict]:
@@ -784,9 +791,23 @@ async def main():
     parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
     parser.add_argument('--port', type=int, default=9999, help='Main port')
     parser.add_argument('--probe-port', type=int, default=9998, help='Probe port for NAT analysis')
+    parser.add_argument(
+        '--max-scan-ports',
+        type=int,
+        default=MAX_SCAN_PORTS,
+        help=f'Max candidate ports to send to clients (default: {MAX_SCAN_PORTS})',
+    )
     args = parser.parse_args()
+
+    if args.max_scan_ports < 1:
+        parser.error('--max-scan-ports must be >= 1')
     
-    server = TCPRelayServerICE(args.host, args.port, args.probe_port)
+    server = TCPRelayServerICE(
+        args.host,
+        args.port,
+        args.probe_port,
+        max_scan_ports=args.max_scan_ports,
+    )
     await server.start()
 
 
