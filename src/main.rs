@@ -34,7 +34,7 @@ use hole_punch::{HolePunchConfig, HolePunchResult, PeerAddress, do_hole_punch};
 use transfer::{TcpSender, TcpReceiver, calculate_sha256, set_chunk_size};
 
 /// Number of NAT probes to send
-const NAT_PROBE_COUNT: u32 = 10;
+const DEFAULT_NAT_PROBE_COUNT: u32 = 10;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Mode {
@@ -67,6 +67,10 @@ struct Args {
     /// Hole punch timeout in seconds
     #[arg(long, default_value = "30")]
     timeout: u64,
+
+    /// Number of NAT probes to send (higher can improve symmetric/random NAT success)
+    #[arg(long, default_value_t = DEFAULT_NAT_PROBE_COUNT)]
+    probe_count: u32,
     
     /// Enable debug logging
     #[arg(long)]
@@ -203,6 +207,7 @@ async fn run_relay_protocol(
     role: &str,
     local_port: u16,
     _timeout: Duration,
+    probe_count: u32,
 ) -> Result<(TcpStream, Session)> {
     info!("Connecting to relay server: {}", server_addr);
     
@@ -321,7 +326,7 @@ async fn run_relay_protocol(
                             // Build probe server address using the relay server IP
                             if let Ok(server_sock_addr) = server_addr.parse::<SocketAddr>() {
                                 let probe_addr = format!("{}:{}", server_sock_addr.ip(), pp);
-                                if let Err(e) = do_nat_probing(&probe_addr, session_id, NAT_PROBE_COUNT).await {
+                                if let Err(e) = do_nat_probing(&probe_addr, session_id, probe_count).await {
                                     warn!("NAT probing failed: {} - continuing anyway", e);
                                 }
                             }
@@ -411,6 +416,7 @@ async fn run_sender(
     session_id: &str,
     file_path: &str,
     timeout: Duration,
+    probe_count: u32,
 ) -> Result<()> {
     // FIRST: Calculate SHA256 BEFORE connecting to relay
     // This can take a long time for large files, and we don't want to
@@ -427,7 +433,7 @@ async fn run_sender(
     
     // Run relay protocol to get peer info and GO signal
     let (_relay_stream, session) = run_relay_protocol(
-        server_addr, session_id, "sender", local_port, timeout
+        server_addr, session_id, "sender", local_port, timeout, probe_count
     ).await?;
     
     // We can close relay connection now - we have all the info we need
@@ -470,6 +476,7 @@ async fn run_receiver(
     server_addr: &str,
     session_id: &str,
     timeout: Duration,
+    probe_count: u32,
 ) -> Result<()> {
     // Get local port for hole punching
     let local_port = get_free_port()?;
@@ -477,7 +484,7 @@ async fn run_receiver(
     
     // Run relay protocol to get peer info and GO signal
     let (_relay_stream, session) = run_relay_protocol(
-        server_addr, session_id, "receiver", local_port, timeout
+        server_addr, session_id, "receiver", local_port, timeout, probe_count
     ).await?;
     
     let peer_addr = session.peer_public_addr
@@ -569,14 +576,14 @@ async fn main() -> Result<()> {
             info!("Session: {}", args.session_id);
             info!("");
             
-            run_sender(&args.server, &args.session_id, file_path, timeout).await
+            run_sender(&args.server, &args.session_id, file_path, timeout, args.probe_count).await
         }
         Mode::Receive => {
             info!("Mode: RECEIVE");
             info!("Session: {}", args.session_id);
             info!("");
             
-            run_receiver(&args.server, &args.session_id, timeout).await
+            run_receiver(&args.server, &args.session_id, timeout, args.probe_count).await
         }
     }
 }

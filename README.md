@@ -91,6 +91,7 @@ Options:
   -m, --mode <MODE>          Mode: send or receive
   -f, --file <FILE>          File to send (sender mode only)
       --timeout <SECONDS>    Hole punch timeout [default: 30]
+      --probe-count <N>      NAT probe connection count [default: 10]
       --debug                Enable debug logging
   -h, --help                 Print help
   -V, --version              Print version
