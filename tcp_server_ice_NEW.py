@@ -108,7 +108,7 @@ class Peer:
     probes_done: bool = False  # True when probing phase complete
     needs_probing: bool = False  # True if NAT port changed (not preserved)
     prediction_mode: str = "delta"  # delta or external
-    prediction_bias_pct: float = 0.0  # percent bias applied to prediction
+    prediction_range_extra_pct: float = 0.0  # percent to expand scan range
 
 
 class TCPRelayServerICE:
@@ -213,7 +213,7 @@ class TCPRelayServerICE:
         probes: List[Tuple[str, int, int, float]],
         target_local_port: int,
         prediction_mode: str,
-        prediction_bias_pct: float,
+        prediction_range_extra_pct: float,
     ) -> NATAnalysis:
         """Analyze NAT behavior and predict the peer-facing port range."""
         analysis = NATAnalysis()
@@ -252,13 +252,9 @@ class TCPRelayServerICE:
             logger.info("NAT Analysis: port preserved (no scan needed)")
             return analysis
 
-        if prediction_bias_pct != 0.0:
-            logger.info("NAT Analysis: applying prediction bias %.2f%%", prediction_bias_pct)
-
         if use_external:
             mean_port = statistics.mean(analysis.probed_ports)
-            biased_mean = mean_port * (1.0 + (prediction_bias_pct / 100.0))
-            predicted = int(round(biased_mean))
+            predicted = int(round(mean_port))
             analysis.predicted_port = max(MIN_PORT, min(MAX_PORT, predicted))
 
             max_dev = max(abs(p - mean_port) for p in analysis.probed_ports)
@@ -281,8 +277,7 @@ class TCPRelayServerICE:
             analysis.delta_median = statistics.median(deltas)
             analysis.delta_stdev = statistics.pstdev(deltas) if len(deltas) > 1 else 0.0
 
-            adjusted_delta = analysis.delta_median * (1.0 + (prediction_bias_pct / 100.0))
-            predicted = int(round(target_local_port + adjusted_delta))
+            predicted = int(round(target_local_port + analysis.delta_median))
             analysis.predicted_port = max(MIN_PORT, min(MAX_PORT, predicted))
 
             max_dev = max(abs(d - analysis.delta_median) for d in deltas)
@@ -320,6 +315,29 @@ class TCPRelayServerICE:
         analysis.scan_end = min(MAX_PORT, analysis.predicted_port + analysis.error_range)
         analysis.needs_scan = analysis.error_range > 0
 
+        def apply_range_extra() -> None:
+            if prediction_range_extra_pct <= 0.0:
+                return
+            if analysis.scan_start <= 0 or analysis.scan_end <= 0:
+                return
+            if analysis.scan_end < analysis.scan_start:
+                return
+            span = analysis.scan_end - analysis.scan_start
+            if span <= 0:
+                return
+            extra_total = int(round(span * (prediction_range_extra_pct / 100.0)))
+            if extra_total <= 0:
+                return
+            pad_low = extra_total // 2
+            pad_high = extra_total - pad_low
+            analysis.scan_start = max(MIN_PORT, analysis.scan_start - pad_low)
+            analysis.scan_end = min(MAX_PORT, analysis.scan_end + pad_high)
+            analysis.needs_scan = True
+            logger.info(
+                "NAT Analysis: expanded scan range by %.2f%%",
+                prediction_range_extra_pct,
+            )
+
         if use_external:
             if analysis.port_range == 0:
                 analysis.pattern_type = "constant"
@@ -338,6 +356,7 @@ class TCPRelayServerICE:
                 analysis.scan_start = max(MIN_PORT, analysis.min_port)
                 analysis.scan_end = min(MAX_PORT, analysis.max_port)
                 analysis.needs_scan = True
+            apply_range_extra()
 
             logger.info(
                 "NAT Analysis (external): predicted=%s range=%s-%s",
@@ -366,6 +385,7 @@ class TCPRelayServerICE:
             analysis.scan_start = max(MIN_PORT, analysis.min_port)
             analysis.scan_end = min(MAX_PORT, analysis.max_port)
             analysis.needs_scan = True
+        apply_range_extra()
 
         logger.info(
             "NAT Analysis: delta_range=%s predicted=%s range=%s-%s",
@@ -405,12 +425,15 @@ class TCPRelayServerICE:
             if prediction_mode not in ('delta', 'external'):
                 logger.warning(f"Unknown prediction_mode '{prediction_mode}', defaulting to 'delta'")
                 prediction_mode = 'delta'
-            bias_raw = msg.get('prediction_bias_pct', 0.0)
+            range_raw = msg.get('prediction_range_extra_pct', 0.0)
             try:
-                prediction_bias_pct = float(bias_raw)
+                prediction_range_extra_pct = float(range_raw)
             except (TypeError, ValueError):
-                logger.warning(f"Invalid prediction_bias_pct '{bias_raw}', defaulting to 0.0")
-                prediction_bias_pct = 0.0
+                logger.warning(
+                    "Invalid prediction_range_extra_pct '%s', defaulting to 0.0",
+                    range_raw,
+                )
+                prediction_range_extra_pct = 0.0
             
             if role not in ('sender', 'receiver'):
                 await self.send_error(writer, f"Invalid role: {role}")
@@ -425,7 +448,7 @@ class TCPRelayServerICE:
                 session_id=session_id,
                 private_ip=private_ip,
                 prediction_mode=prediction_mode,
-                prediction_bias_pct=prediction_bias_pct,
+                prediction_range_extra_pct=prediction_range_extra_pct,
             )
             
             lock = self.get_session_lock(session_id)
@@ -521,7 +544,7 @@ class TCPRelayServerICE:
                         peer_probes,
                         peer.local_port,
                         peer.prediction_mode,
-                        peer.prediction_bias_pct,
+                        peer.prediction_range_extra_pct,
                     )
                     # Clear used probes
                     self.pending_probes[session_id] = [
@@ -604,7 +627,7 @@ class TCPRelayServerICE:
                     peer_probes,
                     peer.local_port,
                     peer.prediction_mode,
-                    peer.prediction_bias_pct,
+                    peer.prediction_range_extra_pct,
                 )
                 # Clear used probes
                 self.pending_probes[session_id] = [

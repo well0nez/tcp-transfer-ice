@@ -92,9 +92,9 @@ struct Args {
     #[arg(long, value_enum, default_value_t = PredictionMode::Delta)]
     prediction_mode: PredictionMode,
 
-    /// Bias prediction center by percentage (applies to delta and external)
+    /// Expand prediction scan range by percentage (applies to delta and external)
     #[arg(long, default_value_t = 0.0)]
-    prediction_bias_pct: f64,
+    prediction_range_extra_pct: f64,
     
     /// Enable debug logging
     #[arg(long)]
@@ -233,7 +233,7 @@ async fn run_relay_protocol(
     _timeout: Duration,
     probe_count: u32,
     prediction_mode: PredictionMode,
-    prediction_bias_pct: f64,
+    prediction_range_extra_pct: f64,
 ) -> Result<(TcpStream, Session)> {
     info!("Connecting to relay server: {}", server_addr);
     
@@ -269,7 +269,7 @@ async fn run_relay_protocol(
         role,
         local_port,
         Some(prediction_mode.as_str().to_string()),
-        Some(prediction_bias_pct),
+        Some(prediction_range_extra_pct),
     );
     let msg = serde_json::to_string(&register)? + "\n";
     writer.write_all(msg.as_bytes()).await?;
@@ -450,7 +450,7 @@ async fn run_sender(
     timeout: Duration,
     probe_count: u32,
     prediction_mode: PredictionMode,
-    prediction_bias_pct: f64,
+    prediction_range_extra_pct: f64,
 ) -> Result<()> {
     // FIRST: Calculate SHA256 BEFORE connecting to relay
     // This can take a long time for large files, and we don't want to
@@ -474,7 +474,7 @@ async fn run_sender(
         timeout,
         probe_count,
         prediction_mode,
-        prediction_bias_pct,
+        prediction_range_extra_pct,
     ).await?;
     
     // We can close relay connection now - we have all the info we need
@@ -519,7 +519,7 @@ async fn run_receiver(
     timeout: Duration,
     probe_count: u32,
     prediction_mode: PredictionMode,
-    prediction_bias_pct: f64,
+    prediction_range_extra_pct: f64,
 ) -> Result<()> {
     // Get local port for hole punching
     let local_port = get_free_port()?;
@@ -534,7 +534,7 @@ async fn run_receiver(
         timeout,
         probe_count,
         prediction_mode,
-        prediction_bias_pct,
+        prediction_range_extra_pct,
     ).await?;
     
     let peer_addr = session.peer_public_addr
@@ -633,7 +633,7 @@ async fn main() -> Result<()> {
                 timeout,
                 args.probe_count,
                 args.prediction_mode,
-                args.prediction_bias_pct,
+                args.prediction_range_extra_pct,
             ).await
         }
         Mode::Receive => {
@@ -647,7 +647,7 @@ async fn main() -> Result<()> {
                 timeout,
                 args.probe_count,
                 args.prediction_mode,
-                args.prediction_bias_pct,
+                args.prediction_range_extra_pct,
             ).await
         }
     }

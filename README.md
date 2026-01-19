@@ -60,9 +60,10 @@ using local-port deltas. This can help when symmetric/random NATs allocate ports
 - Pros: Can stabilize prediction when local-port deltas are noisy or misleading.
 - Cons: Ignores local-port correlation; may reduce accuracy on stable delta NATs.
 
-You can also bias the prediction center with `--prediction-bias-pct` (applies to both modes).
-Positive values push the predicted port upward; negative values shift it downward. Large
-percentages can overshoot the actual NAT port, so use with care.
+You can also expand the scan range with `--prediction-range-extra-pct` (applies to both modes).
+The value is a percentage of the computed scan span and is split across both sides of the
+window. Example: a range of 100..200 with 5 expands to 98..203, and the final candidate
+list is still capped by `MAX_SCAN_PORTS`.
 
 ## Usage
 
@@ -79,7 +80,7 @@ Relay server options:
   --host <HOST>             Host to bind to [default: 0.0.0.0]
   --port <PORT>             Main port [default: 9999]
   --probe-port <PORT>       Probe port for NAT analysis [default: 9998]
-  --max-scan-ports <N>      Max candidate ports sent to clients [default: 128]
+  --max-scan-ports <N>      Max candidate ports sent to clients [default: 512]
 ```
 
 ### Receiver (start first)
@@ -105,7 +106,7 @@ Options:
       --timeout <SECONDS>    Hole punch timeout [default: 30]
       --probe-count <N>      NAT probe connection count [default: 10]
       --prediction-mode <MODE>  NAT prediction mode: delta or external [default: delta]
-      --prediction-bias-pct <PCT>  Bias prediction center by percentage [default: 0]
+      --prediction-range-extra-pct <PCT>  Expand scan range by percentage [default: 0]
       --debug                Enable debug logging
   -h, --help                 Print help
   -V, --version              Print version
