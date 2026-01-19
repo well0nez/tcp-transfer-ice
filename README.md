@@ -49,8 +49,9 @@ NAT because the peer-specific NAT port may lie outside the small probe-derived r
 - Pros: Higher success probability when NAT port allocation is wide or target-dependent.
 - Cons: More outbound connection attempts, higher CPU/network load, and potential throttling by NATs/ISPs.
 
-In our tests, setting `--max-scan-ports 512` reached roughly 99% success on difficult NAT pairs, but
-results depend on the networks and devices involved.
+In our tests, success on difficult NAT pairs improved most when widening the scan window with
+`--prediction-range-extra-pct` (often 20-50), and a higher `--max-scan-ports` helped ensure the wider
+window could actually be attempted. Results still depend on the networks and devices involved.
 
 ### Client Prediction Mode
 
