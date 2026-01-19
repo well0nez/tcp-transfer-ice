@@ -22,16 +22,24 @@ pub struct RegisterMessage {
     pub local_port: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub private_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prediction_mode: Option<String>,
 }
 
 impl RegisterMessage {
-    pub fn new(session_id: &str, role: &str, local_port: u16) -> Self {
+    pub fn new(
+        session_id: &str,
+        role: &str,
+        local_port: u16,
+        prediction_mode: Option<String>,
+    ) -> Self {
         Self {
             msg_type: "register".to_string(),
             session_id: session_id.to_string(),
             role: role.to_string(),
             local_port,
             private_ip: get_private_ip(),
+            prediction_mode,
         }
     }
 }

@@ -107,6 +107,7 @@ class Peer:
     probe_ports: List[Tuple[int, int]] = field(default_factory=list)  # [(local, nat), ...]
     probes_done: bool = False  # True when probing phase complete
     needs_probing: bool = False  # True if NAT port changed (not preserved)
+    prediction_mode: str = "delta"  # delta or external
 
 
 class TCPRelayServerICE:
@@ -118,13 +119,11 @@ class TCPRelayServerICE:
         port: int = 9999,
         probe_port: int = 9998,
         max_scan_ports: int = MAX_SCAN_PORTS,
-        external_only: bool = False,
     ):
         self.host = host
         self.port = port
         self.probe_port = probe_port
         self.max_scan_ports = max(1, max_scan_ports)
-        self.external_only = external_only
         self.sessions: Dict[str, Dict[str, Peer]] = {}
         self.session_locks: Dict[str, asyncio.Lock] = {}
         # Probe connections waiting to be claimed
@@ -208,15 +207,21 @@ class TCPRelayServerICE:
             self.session_locks[session_id] = asyncio.Lock()
         return self.session_locks[session_id]
     
-    def analyze_nat(self, probes: List[Tuple[str, int, int, float]], target_local_port: int) -> NATAnalysis:
+    def analyze_nat(
+        self,
+        probes: List[Tuple[str, int, int, float]],
+        target_local_port: int,
+        prediction_mode: str,
+    ) -> NATAnalysis:
         """Analyze NAT behavior and predict the peer-facing port range."""
         analysis = NATAnalysis()
+        use_external = prediction_mode == "external"
 
         if len(probes) < 2:
             analysis.pattern_type = "insufficient_data"
             return analysis
 
-        if not self.external_only and target_local_port <= 0:
+        if not use_external and target_local_port <= 0:
             analysis.pattern_type = "insufficient_data"
             return analysis
 
@@ -245,7 +250,7 @@ class TCPRelayServerICE:
             logger.info("NAT Analysis: port preserved (no scan needed)")
             return analysis
 
-        if self.external_only:
+        if use_external:
             mean_port = statistics.mean(analysis.probed_ports)
             predicted = int(round(mean_port))
             analysis.predicted_port = max(MIN_PORT, min(MAX_PORT, predicted))
@@ -308,7 +313,7 @@ class TCPRelayServerICE:
         analysis.scan_end = min(MAX_PORT, analysis.predicted_port + analysis.error_range)
         analysis.needs_scan = analysis.error_range > 0
 
-        if self.external_only:
+        if use_external:
             if analysis.port_range == 0:
                 analysis.pattern_type = "constant"
                 analysis.needs_scan = False
@@ -389,6 +394,10 @@ class TCPRelayServerICE:
             local_port = msg.get('local_port', 0)
             private_ip = msg.get('private_ip')
             skip_probing = msg.get('skip_probing', False)  # For clients that don't support probing
+            prediction_mode = (msg.get('prediction_mode') or 'delta').lower()
+            if prediction_mode not in ('delta', 'external'):
+                logger.warning(f"Unknown prediction_mode '{prediction_mode}', defaulting to 'delta'")
+                prediction_mode = 'delta'
             
             if role not in ('sender', 'receiver'):
                 await self.send_error(writer, f"Invalid role: {role}")
@@ -401,7 +410,8 @@ class TCPRelayServerICE:
                 local_port=local_port,
                 role=role,
                 session_id=session_id,
-                private_ip=private_ip
+                private_ip=private_ip,
+                prediction_mode=prediction_mode,
             )
             
             lock = self.get_session_lock(session_id)
@@ -493,7 +503,11 @@ class TCPRelayServerICE:
                 
                 if len(peer_probes) >= 5:  # Minimum probes needed
                     logger.info(f"Got {len(peer_probes)} probes from {peer.role}")
-                    peer.nat_analysis = self.analyze_nat(peer_probes, peer.local_port)
+                    peer.nat_analysis = self.analyze_nat(
+                        peer_probes,
+                        peer.local_port,
+                        peer.prediction_mode,
+                    )
                     # Clear used probes
                     self.pending_probes[session_id] = [
                         (ip, nat, local, ts) for ip, nat, local, ts in probes
@@ -571,7 +585,11 @@ class TCPRelayServerICE:
             
             if peer_probes:
                 logger.info(f"Analyzing {len(peer_probes)} probes from {peer.role}")
-                peer.nat_analysis = self.analyze_nat(peer_probes, peer.local_port)
+                peer.nat_analysis = self.analyze_nat(
+                    peer_probes,
+                    peer.local_port,
+                    peer.prediction_mode,
+                )
                 # Clear used probes
                 self.pending_probes[session_id] = [
                     (ip, nat, local, ts) for ip, nat, local, ts in probes
@@ -841,11 +859,6 @@ async def main():
         default=MAX_SCAN_PORTS,
         help=f'Max candidate ports to send to clients (default: {MAX_SCAN_PORTS})',
     )
-    parser.add_argument(
-        '--external-only',
-        action='store_true',
-        help='Predict using only observed public ports (no local-port delta)',
-    )
     args = parser.parse_args()
 
     if args.max_scan_ports < 1:
@@ -856,7 +869,6 @@ async def main():
         args.port,
         args.probe_port,
         max_scan_ports=args.max_scan_ports,
-        external_only=args.external_only,
     )
     await server.start()
 

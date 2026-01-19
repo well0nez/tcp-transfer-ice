@@ -43,6 +43,21 @@ enum Mode {
     Receive,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PredictionMode {
+    Delta,
+    External,
+}
+
+impl PredictionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            PredictionMode::Delta => "delta",
+            PredictionMode::External => "external",
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "tcp-transfer")]
 #[command(author = "TCP Transfer Team")]
@@ -72,6 +87,10 @@ struct Args {
     /// Number of NAT probes to send (higher can improve symmetric/random NAT success)
     #[arg(long, default_value_t = DEFAULT_NAT_PROBE_COUNT)]
     probe_count: u32,
+
+    /// NAT prediction mode: delta or external
+    #[arg(long, value_enum, default_value_t = PredictionMode::Delta)]
+    prediction_mode: PredictionMode,
     
     /// Enable debug logging
     #[arg(long)]
@@ -209,6 +228,7 @@ async fn run_relay_protocol(
     local_port: u16,
     _timeout: Duration,
     probe_count: u32,
+    prediction_mode: PredictionMode,
 ) -> Result<(TcpStream, Session)> {
     info!("Connecting to relay server: {}", server_addr);
     
@@ -239,7 +259,12 @@ async fn run_relay_protocol(
     let mut reader = BufReader::new(reader);
     
     // Send registration
-    let register = RegisterMessage::new(session_id, role, local_port);
+    let register = RegisterMessage::new(
+        session_id,
+        role,
+        local_port,
+        Some(prediction_mode.as_str().to_string()),
+    );
     let msg = serde_json::to_string(&register)? + "\n";
     writer.write_all(msg.as_bytes()).await?;
     writer.flush().await?;
@@ -418,6 +443,7 @@ async fn run_sender(
     file_path: &str,
     timeout: Duration,
     probe_count: u32,
+    prediction_mode: PredictionMode,
 ) -> Result<()> {
     // FIRST: Calculate SHA256 BEFORE connecting to relay
     // This can take a long time for large files, and we don't want to
@@ -434,7 +460,13 @@ async fn run_sender(
     
     // Run relay protocol to get peer info and GO signal
     let (_relay_stream, session) = run_relay_protocol(
-        server_addr, session_id, "sender", local_port, timeout, probe_count
+        server_addr,
+        session_id,
+        "sender",
+        local_port,
+        timeout,
+        probe_count,
+        prediction_mode,
     ).await?;
     
     // We can close relay connection now - we have all the info we need
@@ -478,6 +510,7 @@ async fn run_receiver(
     session_id: &str,
     timeout: Duration,
     probe_count: u32,
+    prediction_mode: PredictionMode,
 ) -> Result<()> {
     // Get local port for hole punching
     let local_port = get_free_port()?;
@@ -485,7 +518,13 @@ async fn run_receiver(
     
     // Run relay protocol to get peer info and GO signal
     let (_relay_stream, session) = run_relay_protocol(
-        server_addr, session_id, "receiver", local_port, timeout, probe_count
+        server_addr,
+        session_id,
+        "receiver",
+        local_port,
+        timeout,
+        probe_count,
+        prediction_mode,
     ).await?;
     
     let peer_addr = session.peer_public_addr
@@ -577,14 +616,27 @@ async fn main() -> Result<()> {
             info!("Session: {}", args.session_id);
             info!("");
             
-            run_sender(&args.server, &args.session_id, file_path, timeout, args.probe_count).await
+            run_sender(
+                &args.server,
+                &args.session_id,
+                file_path,
+                timeout,
+                args.probe_count,
+                args.prediction_mode,
+            ).await
         }
         Mode::Receive => {
             info!("Mode: RECEIVE");
             info!("Session: {}", args.session_id);
             info!("");
             
-            run_receiver(&args.server, &args.session_id, timeout, args.probe_count).await
+            run_receiver(
+                &args.server,
+                &args.session_id,
+                timeout,
+                args.probe_count,
+                args.prediction_mode,
+            ).await
         }
     }
 }
